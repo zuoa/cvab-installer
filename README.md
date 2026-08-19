@@ -4,10 +4,14 @@ RK3588 盒子环境初始化脚本：检查并无损升级 **RKNN Runtime 2.3.2*
 
 ## 一键安装
 
-仓库推送到 GitHub 后：
-
 ```bash
 curl -fsSL https://raw.githubusercontent.com/zuoa/cvab-installer/master/install.sh | sudo bash
+```
+
+GitHub raw 本身超时可用国内镜像拉脚本：
+
+```bash
+curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/zuoa/cvab-installer/master/install.sh | sudo bash
 ```
 
 已 clone 本仓库时：
@@ -80,6 +84,6 @@ docker compose down
 ## 注意
 
 - 脚本只应在 **RK3588 / aarch64 / Debian 或 Ubuntu** 上跑。
-- GitHub 仓库若尚未推送本脚本，远端 `curl | bash` 不可用，请先 clone 后本地执行。
+- 拉 GitHub 文件时先走官方源（约 10s 连接 / 45s 总超时）；失败后自动换 ghfast、gh-proxy、ghproxy、gitdl、gitmirror、jsDelivr、kkgithub。`git clone` 同样回退。
 - 不修改 Docker 镜像加速；国内拉官方/ghcr 较慢时请自行配置 daemon mirror。
 - worker 需要 NPU/MPP 设备节点（`/dev/dri`、`/dev/mpp_service`、`/dev/rga`）以及 privileged；节点缺失脚本只警告。

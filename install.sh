@@ -9,6 +9,16 @@ REPO_RAW_CANDIDATES=(
   "https://raw.githubusercontent.com/zuoa/cvab-installer/master"
   "https://raw.githubusercontent.com/zuoa/cvab-installer/main"
 )
+# Official first; on timeout/failure wrap github.com / raw.githubusercontent.com.
+# These prefixes are prepended to the original URL (https://mirror/.../https://github.com/...).
+GH_PROXY_PREFIXES=(
+  "https://ghfast.top/"
+  "https://gh-proxy.com/"
+  "https://mirror.ghproxy.com/"
+  "https://gitdl.cn/"
+)
+CURL_CONNECT_TIMEOUT=10
+CURL_MAX_TIME=45
 RKNN_TAG="v${TARGET_RKNN_VERSION}"
 RKNN_LIB_REL="rknpu2/runtime/Linux/librknn_api/aarch64/librknnrt.so"
 RKNN_SERVER_REL="rknpu2/runtime/Linux/rknn_server/aarch64/usr/bin/rknn_server"
@@ -164,13 +174,61 @@ ensure_pkg() {
   fi
 }
 
+is_github_origin() {
+  case "$1" in
+    https://github.com/*|https://raw.githubusercontent.com/*|https://codeload.github.com/*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# Print the original URL, then China-reachable mirrors. Non-GitHub URLs are unchanged.
+expand_github_mirrors() {
+  local url="$1"
+  printf '%s\n' "$url"
+  is_github_origin "$url" || return 0
+
+  local prefix
+  for prefix in "${GH_PROXY_PREFIXES[@]}"; do
+    printf '%s\n' "${prefix}${url}"
+  done
+
+  local owner repo ref path
+  if [[ "$url" =~ ^https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.*)$ ]]; then
+    owner="${BASH_REMATCH[1]}"
+    repo="${BASH_REMATCH[2]}"
+    ref="${BASH_REMATCH[3]}"
+    path="${BASH_REMATCH[4]}"
+    printf '%s\n' "https://raw.gitmirror.com/${owner}/${repo}/${ref}/${path}"
+    printf '%s\n' "https://cdn.jsdelivr.net/gh/${owner}/${repo}@${ref}/${path}"
+    printf '%s\n' "https://raw.kkgithub.com/${owner}/${repo}/${ref}/${path}"
+  elif [[ "$url" =~ ^https://github\.com/([^/]+)/([^/]+)/raw/([^/]+)/(.*)$ ]]; then
+    owner="${BASH_REMATCH[1]}"
+    repo="${BASH_REMATCH[2]}"
+    ref="${BASH_REMATCH[3]}"
+    path="${BASH_REMATCH[4]}"
+    printf '%s\n' "https://cdn.jsdelivr.net/gh/${owner}/${repo}@${ref}/${path}"
+    printf '%s\n' "https://raw.gitmirror.com/${owner}/${repo}/${ref}/${path}"
+    printf '%s\n' "https://kkgithub.com/${owner}/${repo}/raw/${ref}/${path}"
+  elif [[ "$url" =~ ^https://github\.com/([^/]+)/([^/]+)/archive/(.*)$ ]]; then
+    owner="${BASH_REMATCH[1]}"
+    repo="${BASH_REMATCH[2]}"
+    printf '%s\n' "https://kkgithub.com/${owner}/${repo}/archive/${BASH_REMATCH[3]}"
+  fi
+}
+
 download() {
   local url="$1"
   local dest="$2"
   if have_cmd curl; then
-    curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 -o "$dest" "$url"
+    # One attempt per URL: fail fast so we can fall through to a mirror.
+    curl -fL --retry 0 --connect-timeout "${CURL_CONNECT_TIMEOUT}" \
+      --max-time "${CURL_MAX_TIME}" -o "$dest" "$url"
   elif have_cmd wget; then
-    wget -O "$dest" "$url"
+    wget --timeout="${CURL_CONNECT_TIMEOUT}" --tries=1 -O "$dest" "$url"
   else
     die "需要 curl 或 wget"
   fi
@@ -179,14 +237,58 @@ download() {
 try_download() {
   local dest="$1"
   shift
-  local url
+  local url expanded
+  local -a queue=()
+  local -A seen=()
   for url in "$@"; do
+    while IFS= read -r expanded; do
+      [[ -n "$expanded" ]] || continue
+      [[ -z "${seen[$expanded]+x}" ]] || continue
+      seen["$expanded"]=1
+      queue+=("$expanded")
+    done < <(expand_github_mirrors "$url")
+  done
+  for url in "${queue[@]}"; do
     info "下载 $url"
     if download "$url" "$dest"; then
+      ok "下载成功"
       return 0
     fi
-    warn "失败: $url"
+    warn "失败，尝试下一源"
     rm -f "$dest"
+  done
+  return 1
+}
+
+clone_github() {
+  local dest="$1"
+  local url="${2:-$REPO_URL}"
+  local candidate
+  local -a queue=()
+  queue+=("$url")
+  if [[ "$url" == https://github.com/* ]]; then
+    local prefix
+    for prefix in "${GH_PROXY_PREFIXES[@]}"; do
+      queue+=("${prefix}${url}")
+    done
+    # hostname rewrite: github.com/a/b.git -> kkgithub.com/a/b.git
+    queue+=("https://kkgithub.com/${url#https://github.com/}")
+    queue+=("https://gitclone.com/github.com/${url#https://github.com/}")
+  fi
+  if ! have_cmd git; then
+    return 1
+  fi
+  for candidate in "${queue[@]}"; do
+    info "git clone $candidate"
+    rm -rf "$dest"
+    if git -c http.lowSpeedLimit=1024 -c http.lowSpeedTime=20 \
+      -c http.connectTimeout="${CURL_CONNECT_TIMEOUT}" \
+      clone --depth 1 "$candidate" "$dest"; then
+      ok "clone 成功"
+      return 0
+    fi
+    warn "clone 失败，尝试下一源"
+    rm -rf "$dest"
   done
   return 1
 }
@@ -633,12 +735,11 @@ copy_or_fetch() {
   fi
   info "从 GitHub 拉取 $rel"
   local base
+  local -a urls=()
   for base in "${REPO_RAW_CANDIDATES[@]}"; do
-    if download "${base}/${rel}" "$dest"; then
-      return 0
-    fi
+    urls+=("${base}/${rel}")
   done
-  return 1
+  try_download "$dest" "${urls[@]}"
 }
 
 choose_mqtt() {
@@ -688,8 +789,8 @@ setup_compose() {
   fetched="$(mktemp -d /tmp/cvab-compose.XXXXXX)"
   if ! copy_or_fetch "$src_compose" "${fetched}/docker-compose.yml"; then
     if [[ -z "$SCRIPT_DIR" ]] && have_cmd git; then
-      info "raw 下载失败，改为 git clone ${REPO_URL}"
-      git clone --depth 1 "$REPO_URL" "${fetched}/repo"
+      info "raw 下载失败，改为 git clone（含国内镜像）"
+      clone_github "${fetched}/repo" "$REPO_URL" || die "无法 clone ${REPO_URL}"
       [[ -f "${fetched}/repo/${src_compose}" ]] || die "仓库中没有 ${src_compose}（远端可能尚未推送）"
       cp -f "${fetched}/repo/${src_compose}" "${fetched}/docker-compose.yml"
       [[ -f "${fetched}/repo/mediamtx.yml" ]] && cp -f "${fetched}/repo/mediamtx.yml" "${fetched}/mediamtx.yml"
