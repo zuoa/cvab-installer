@@ -7,7 +7,7 @@ RK3588 盒子环境初始化脚本：检查并无损升级 **RKNN Runtime 2.3.2*
 仓库推送到 GitHub 后：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zuoa/cvab-installer/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/zuoa/cvab-installer/master/install.sh | sudo bash
 ```
 
 已 clone 本仓库时：

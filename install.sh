@@ -4,7 +4,11 @@ set -euo pipefail
 
 TARGET_RKNN_VERSION="2.3.2"
 REPO_URL="https://github.com/zuoa/cvab-installer.git"
-REPO_RAW="https://raw.githubusercontent.com/zuoa/cvab-installer/main"
+# Default branch is master; also try main so either raw URL works.
+REPO_RAW_CANDIDATES=(
+  "https://raw.githubusercontent.com/zuoa/cvab-installer/master"
+  "https://raw.githubusercontent.com/zuoa/cvab-installer/main"
+)
 RKNN_TAG="v${TARGET_RKNN_VERSION}"
 RKNN_LIB_REL="rknpu2/runtime/Linux/librknn_api/aarch64/librknnrt.so"
 RKNN_SERVER_REL="rknpu2/runtime/Linux/rknn_server/aarch64/usr/bin/rknn_server"
@@ -76,7 +80,7 @@ RK3588 环境初始化：RKNN Runtime 2.3.2 + Docker + RKNN compose
 示例:
   sudo bash install.sh
   sudo bash install.sh --mqtt --no-start
-  curl -fsSL https://raw.githubusercontent.com/zuoa/cvab-installer/main/install.sh | sudo bash -s -- --mqtt --no-start
+  curl -fsSL https://raw.githubusercontent.com/zuoa/cvab-installer/master/install.sh | sudo bash -s -- --mqtt --no-start
 EOF
 }
 
@@ -628,9 +632,12 @@ copy_or_fetch() {
     return 0
   fi
   info "从 GitHub 拉取 $rel"
-  if download "${REPO_RAW}/${rel}" "$dest"; then
-    return 0
-  fi
+  local base
+  for base in "${REPO_RAW_CANDIDATES[@]}"; do
+    if download "${base}/${rel}" "$dest"; then
+      return 0
+    fi
+  done
   return 1
 }
 
