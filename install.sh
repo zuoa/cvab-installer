@@ -32,7 +32,9 @@ DEFAULT_WORKDIR="/opt/cvab"
 BACKUP_ROOT="/var/backups/rknn-runtime"
 
 WORKDIR="${DEFAULT_WORKDIR}"
+PLATFORM=""           # rknn | jetson | cuda | cpu
 MQTT_MODE=""          # mqtt | no-mqtt
+RABBITMQ_MODE=""      # rabbitmq | no-rabbitmq
 SKIP_RKNN=0
 SKIP_DOCKER=0
 START_MODE=""         # start | no-start
@@ -71,25 +73,28 @@ step() { printf '\n%s==> [%s] %s%s\n' "$C_BOLD" "$1" "$2" "$C_RESET"; }
 
 usage() {
   cat <<'EOF'
-RK3588 环境初始化：RKNN Runtime 2.3.2 + Docker + RKNN compose
+盒子环境初始化：探测平台，可选 MQTT/RabbitMQ，生成 docker-compose.yml
 
 用法:
   sudo bash install.sh [选项]
 
 选项:
-  --mqtt              部署带 MQTT 的 compose（非交互）
-  --no-mqtt           部署不带 MQTT 的 compose（非交互）
+  --platform rknn|jetson|cuda|cpu
+                      覆盖自动探测的平台
+  --mqtt / --no-mqtt  是否部署 Mosquitto（非交互必填）
+  --rabbitmq / --no-rabbitmq
+                      是否部署 RabbitMQ（非交互：cuda 默认开，其余默认关）
   --workdir PATH      工作目录，默认 /opt/cvab
   --start             准备完成后执行 docker compose up -d
   --no-start          只准备文件，不启动容器
   --skip-rknn         跳过 RKNN Runtime 检查/升级
   --skip-docker       跳过 Docker 安装
-  --force             非 RK3588 时不询问，继续执行
+  --force             平台探测不确定时不询问，按 cpu 继续
   -h, --help          显示本帮助
 
 示例:
   sudo bash install.sh
-  sudo bash install.sh --mqtt --no-start
+  sudo bash install.sh --platform rknn --mqtt --no-rabbitmq --no-start
   curl -fsSL https://raw.githubusercontent.com/zuoa/cvab-installer/master/install.sh | sudo bash -s -- --mqtt --no-start
 EOF
 }
@@ -99,8 +104,19 @@ EOF
 # ---------------------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --platform)
+      [[ $# -ge 2 ]] || die "--platform 需要 rknn|jetson|cuda|cpu"
+      PLATFORM="$2"
+      case "$PLATFORM" in
+        rknn|jetson|cuda|cpu) ;;
+        *) die "未知平台: $PLATFORM（rknn|jetson|cuda|cpu）" ;;
+      esac
+      shift 2
+      ;;
     --mqtt) MQTT_MODE="mqtt"; shift ;;
     --no-mqtt) MQTT_MODE="no-mqtt"; shift ;;
+    --rabbitmq) RABBITMQ_MODE="rabbitmq"; shift ;;
+    --no-rabbitmq) RABBITMQ_MODE="no-rabbitmq"; shift ;;
     --workdir)
       [[ $# -ge 2 ]] || die "--workdir 需要路径"
       WORKDIR="$2"
@@ -351,6 +367,56 @@ docker_family() {
   return 1
 }
 
+platform_base_file() {
+  case "$PLATFORM" in
+    rknn) printf '%s\n' "docker-compose.no-mqtt.yml.rknn" ;;
+    jetson) printf '%s\n' "docker-compose.no-mqtt.yml.jetson" ;;
+    cuda) printf '%s\n' "docker-compose.no-mqtt.yml.x86+cuda" ;;
+    cpu) printf '%s\n' "docker-compose.no-mqtt.yml" ;;
+    *) die "未知平台: ${PLATFORM:-<empty>}" ;;
+  esac
+}
+
+detect_platform() {
+  if [[ -n "$PLATFORM" ]]; then
+    ok "平台（参数）: $PLATFORM"
+    return 0
+  fi
+  local arch compatible=""
+  arch="$(uname -m)"
+  if [[ -r /proc/device-tree/compatible ]]; then
+    compatible="$(tr '\0' ' ' < /proc/device-tree/compatible)"
+  fi
+  if [[ "$compatible" == *rk3588* ]]; then
+    PLATFORM="rknn"
+  elif [[ -f /etc/nv_tegra_release || "$compatible" == *tegra* || "$compatible" == *jetson* ]]; then
+    PLATFORM="jetson"
+  elif [[ "$arch" == "x86_64" || "$arch" == "amd64" ]]; then
+    if have_cmd nvidia-smi && nvidia-smi >/dev/null 2>&1; then
+      PLATFORM="cuda"
+    else
+      PLATFORM="cpu"
+    fi
+  else
+    warn "无法从硬件识别平台（arch=$arch compatible=${compatible:-<none>}）"
+    local ans=""
+    if [[ "$FORCE" -eq 1 ]]; then
+      PLATFORM="cpu"
+    elif prompt_read $'请选择平台:\n  1) rknn (RK3588)\n  2) jetson\n  3) cuda (x86+NVIDIA)\n  4) cpu\n输入 1-4: ' ans; then
+      case "$ans" in
+        1) PLATFORM="rknn" ;;
+        2) PLATFORM="jetson" ;;
+        3) PLATFORM="cuda" ;;
+        4) PLATFORM="cpu" ;;
+        *) die "无效选择: $ans" ;;
+      esac
+    else
+      die "非交互模式请指定 --platform rknn|jetson|cuda|cpu"
+    fi
+  fi
+  ok "平台: $PLATFORM"
+}
+
 # ---------------------------------------------------------------------------
 # 0. preflight
 # ---------------------------------------------------------------------------
@@ -359,11 +425,8 @@ preflight() {
   require_root "$@"
   read_os
 
-  local arch
+  local arch compatible=""
   arch="$(uname -m)"
-  [[ "$arch" == "aarch64" || "$arch" == "arm64" ]] || die "需要 aarch64，当前是 $arch"
-
-  local compatible=""
   if [[ -r /proc/device-tree/compatible ]]; then
     compatible="$(tr '\0' ' ' < /proc/device-tree/compatible)"
   fi
@@ -373,33 +436,25 @@ preflight() {
   info "架构: $arch"
   info "compatible: ${compatible:-<none>}"
 
-  if [[ "$compatible" != *rk3588* ]]; then
-    warn "未在 device-tree 中检测到 rk3588"
-    if [[ "$FORCE" -ne 1 ]]; then
-      if ! confirm "仍要继续? [y/N] "; then
-        die "已取消。确认是 RK3588 后加 --force 可跳过询问"
-      fi
-    fi
-  else
-    ok "平台: RK3588"
-  fi
+  detect_platform
 
   have_cmd curl || have_cmd wget || ensure_pkg curl
   have_cmd curl || have_cmd wget || die "安装 curl 失败"
 
-  local node
-  for node in /dev/dri /dev/mpp_service /dev/rga; do
-    if [[ -e "$node" ]]; then
-      ok "设备节点 $node"
-    else
-      warn "缺少设备节点 $node（worker 硬解/NPU 可能不可用）"
-    fi
-  done
-
-  if [[ ! -e /sys/kernel/debug/rknpu ]] && [[ -d /sys/kernel/debug ]]; then
-    if ! mountpoint -q /sys/kernel/debug 2>/dev/null; then
-      info "尝试挂载 debugfs（仪表盘 NPU 负载需要）"
-      mount -t debugfs none /sys/kernel/debug 2>/dev/null || true
+  if [[ "$PLATFORM" == "rknn" ]]; then
+    local node
+    for node in /dev/dri /dev/mpp_service /dev/rga; do
+      if [[ -e "$node" ]]; then
+        ok "设备节点 $node"
+      else
+        warn "缺少设备节点 $node（worker 硬解/NPU 可能不可用）"
+      fi
+    done
+    if [[ ! -e /sys/kernel/debug/rknpu ]] && [[ -d /sys/kernel/debug ]]; then
+      if ! mountpoint -q /sys/kernel/debug 2>/dev/null; then
+        info "尝试挂载 debugfs（仪表盘 NPU 负载需要）"
+        mount -t debugfs none /sys/kernel/debug 2>/dev/null || true
+      fi
     fi
   fi
 }
@@ -520,6 +575,11 @@ download_rknn_files() {
 
 install_rknn() {
   step "1/3" "RKNN Runtime ${TARGET_RKNN_VERSION}"
+  if [[ "$PLATFORM" != "rknn" ]]; then
+    info "非 RK3588 平台，跳过 RKNN Runtime"
+    RKNN_ACTION="skipped"
+    return 0
+  fi
   if [[ "$SKIP_RKNN" -eq 1 ]]; then
     warn "已跳过 RKNN（--skip-rknn）"
     RKNN_ACTION="skipped"
@@ -742,20 +802,66 @@ copy_or_fetch() {
   try_download "$dest" "${urls[@]}"
 }
 
-choose_mqtt() {
-  if [[ -n "$MQTT_MODE" ]]; then
-    return 0
-  fi
+choose_extras() {
   local ans=""
-  if prompt_read $'请选择部署变体:\n  1) 带 MQTT（eclipse-mosquitto）\n  2) 不带 MQTT\n输入 1 或 2: ' ans; then
-    case "$ans" in
-      1) MQTT_MODE="mqtt" ;;
-      2) MQTT_MODE="no-mqtt" ;;
-      *) die "无效选择: $ans" ;;
-    esac
+  if [[ -z "$MQTT_MODE" ]]; then
+    if prompt_read "安装 MQTT (Mosquitto)? [Y/n] " ans; then
+      case "$ans" in
+        ""|y|Y|yes|YES) MQTT_MODE="mqtt" ;;
+        n|N|no|NO) MQTT_MODE="no-mqtt" ;;
+        *) die "无效选择: $ans" ;;
+      esac
+    else
+      die "非交互模式请指定 --mqtt 或 --no-mqtt"
+    fi
+  fi
+  if [[ -z "$RABBITMQ_MODE" ]]; then
+    local rabbit_hint="y/N"
+    local rabbit_default="no-rabbitmq"
+    if [[ "$PLATFORM" == "cuda" ]]; then
+      rabbit_hint="Y/n"
+      rabbit_default="rabbitmq"
+    fi
+    if prompt_read "安装 RabbitMQ? [${rabbit_hint}] " ans; then
+      case "$ans" in
+        "") RABBITMQ_MODE="$rabbit_default" ;;
+        y|Y|yes|YES) RABBITMQ_MODE="rabbitmq" ;;
+        n|N|no|NO) RABBITMQ_MODE="no-rabbitmq" ;;
+        *) die "无效选择: $ans" ;;
+      esac
+    else
+      RABBITMQ_MODE="$rabbit_default"
+      info "非交互：RabbitMQ 默认 ${RABBITMQ_MODE}（平台 ${PLATFORM}）"
+    fi
+  fi
+}
+
+resolve_src_dir() {
+  local dest="$1"
+  if [[ -n "$SCRIPT_DIR" && -f "${SCRIPT_DIR}/$(platform_base_file)" ]]; then
+    printf '%s\n' "$SCRIPT_DIR"
     return 0
   fi
-  die "非交互模式请指定 --mqtt 或 --no-mqtt"
+  mkdir -p "$dest"
+  if have_cmd git && clone_github "$dest" "$REPO_URL"; then
+    printf '%s\n' "$dest"
+    return 0
+  fi
+  local rel
+  for rel in \
+    "$(platform_base_file)" \
+    "scripts/render_compose.py" \
+    "mediamtx.yml" \
+    "frontend/nginx.conf" \
+    "overlays/mqtt.yml" \
+    "overlays/rabbitmq.yml" \
+    "deploy/mosquitto.conf"
+  do
+    copy_or_fetch "$rel" "${dest}/${rel}" || true
+  done
+  [[ -f "${dest}/$(platform_base_file)" ]] || die "无法获取平台 compose $(platform_base_file)"
+  [[ -f "${dest}/scripts/render_compose.py" ]] || die "无法获取 scripts/render_compose.py"
+  printf '%s\n' "$dest"
 }
 
 choose_start() {
@@ -770,40 +876,36 @@ choose_start() {
 }
 
 setup_compose() {
-  step "3/3" "RKNN docker-compose"
-  choose_mqtt
+  step "3/3" "生成 docker-compose.yml"
+  choose_extras
 
-  mkdir -p "$WORKDIR/data" "$WORKDIR/deploy"
+  mkdir -p "$WORKDIR/data" "$WORKDIR/deploy" "$WORKDIR/frontend"
 
-  local src_compose dest_compose
+  local src_tmp src_dir base_rel dest_compose
+  src_tmp="$(mktemp -d /tmp/cvab-src.XXXXXX)"
+  src_dir="$(resolve_src_dir "$src_tmp")"
+  base_rel="$(platform_base_file)"
   dest_compose="${WORKDIR}/docker-compose.yml"
+
+  have_cmd python3 || ensure_pkg python3
+  have_cmd python3 || die "需要 python3 以生成 compose"
+
+  local -a render_cmd=(
+    python3 "${src_dir}/scripts/render_compose.py"
+    --base "${src_dir}/${base_rel}"
+    --output "$dest_compose"
+  )
   if [[ "$MQTT_MODE" == "mqtt" ]]; then
-    src_compose="docker-compose.yml.rknn"
-    COMPOSE_VARIANT="带 MQTT"
-  else
-    src_compose="docker-compose.no-mqtt.yml.rknn"
-    COMPOSE_VARIANT="不带 MQTT"
+    [[ -f "${src_dir}/overlays/mqtt.yml" ]] || die "缺少 overlays/mqtt.yml"
+    render_cmd+=(--overlay "${src_dir}/overlays/mqtt.yml")
   fi
-
-  local fetched
-  fetched="$(mktemp -d /tmp/cvab-compose.XXXXXX)"
-  if ! copy_or_fetch "$src_compose" "${fetched}/docker-compose.yml"; then
-    if [[ -z "$SCRIPT_DIR" ]] && have_cmd git; then
-      info "raw 下载失败，改为 git clone（含国内镜像）"
-      clone_github "${fetched}/repo" "$REPO_URL" || die "无法 clone ${REPO_URL}"
-      [[ -f "${fetched}/repo/${src_compose}" ]] || die "仓库中没有 ${src_compose}（远端可能尚未推送）"
-      cp -f "${fetched}/repo/${src_compose}" "${fetched}/docker-compose.yml"
-      [[ -f "${fetched}/repo/mediamtx.yml" ]] && cp -f "${fetched}/repo/mediamtx.yml" "${fetched}/mediamtx.yml"
-      [[ -f "${fetched}/repo/deploy/mosquitto.conf" ]] && cp -f "${fetched}/repo/deploy/mosquitto.conf" "${fetched}/mosquitto.conf"
-    else
-      die "无法获取 ${src_compose}。请在已 clone 的仓库里运行，或先把本仓库推到 GitHub"
-    fi
-  else
-    copy_or_fetch "mediamtx.yml" "${fetched}/mediamtx.yml" || true
-    copy_or_fetch "deploy/mosquitto.conf" "${fetched}/mosquitto.conf" || true
+  # cuda 底座已含 rabbitmq：要关掉就 strip；其他平台要开就叠 overlay
+  if [[ "$PLATFORM" == "cuda" && "$RABBITMQ_MODE" == "no-rabbitmq" ]]; then
+    render_cmd+=(--strip-service rabbitmq --strip-volume rabbitmq-data)
+  elif [[ "$PLATFORM" != "cuda" && "$RABBITMQ_MODE" == "rabbitmq" ]]; then
+    [[ -f "${src_dir}/overlays/rabbitmq.yml" ]] || die "缺少 overlays/rabbitmq.yml"
+    render_cmd+=(--overlay "${src_dir}/overlays/rabbitmq.yml")
   fi
-
-  [[ -s "${fetched}/docker-compose.yml" ]] || die "compose 文件为空"
 
   if [[ -f "$dest_compose" ]]; then
     local bak="${dest_compose}.bak.$(date +%Y%m%d-%H%M%S)"
@@ -811,28 +913,49 @@ setup_compose() {
     info "已备份旧 compose: $bak"
   fi
 
-  cp -f "${fetched}/docker-compose.yml" "$dest_compose"
-  if [[ -f "${fetched}/mediamtx.yml" ]]; then
-    cp -f "${fetched}/mediamtx.yml" "${WORKDIR}/mediamtx.yml"
+  info "渲染 ${base_rel} + extras → ${dest_compose}"
+  "${render_cmd[@]}"
+  [[ -s "$dest_compose" ]] || die "生成的 docker-compose.yml 为空"
+
+  if [[ -f "${src_dir}/mediamtx.yml" ]]; then
+    cp -f "${src_dir}/mediamtx.yml" "${WORKDIR}/mediamtx.yml"
   elif [[ ! -f "${WORKDIR}/mediamtx.yml" ]]; then
     die "缺少 mediamtx.yml"
   fi
+  if [[ -f "${src_dir}/frontend/nginx.conf" ]]; then
+    cp -f "${src_dir}/frontend/nginx.conf" "${WORKDIR}/frontend/nginx.conf"
+  elif [[ ! -f "${WORKDIR}/frontend/nginx.conf" ]]; then
+    die "缺少 frontend/nginx.conf"
+  fi
   if [[ "$MQTT_MODE" == "mqtt" ]]; then
-    if [[ -f "${fetched}/mosquitto.conf" ]]; then
-      cp -f "${fetched}/mosquitto.conf" "${WORKDIR}/deploy/mosquitto.conf"
+    if [[ -f "${src_dir}/deploy/mosquitto.conf" ]]; then
+      cp -f "${src_dir}/deploy/mosquitto.conf" "${WORKDIR}/deploy/mosquitto.conf"
     elif [[ ! -f "${WORKDIR}/deploy/mosquitto.conf" ]]; then
       die "缺少 deploy/mosquitto.conf"
     fi
   fi
-  rm -rf "$fetched"
+
+  cat > "${WORKDIR}/install-options.env" <<EOF
+PLATFORM=${PLATFORM}
+MQTT_MODE=${MQTT_MODE}
+RABBITMQ_MODE=${RABBITMQ_MODE}
+GENERATED_AT=$(date -Iseconds 2>/dev/null || date)
+EOF
+
+  COMPOSE_VARIANT="platform=${PLATFORM} mqtt=${MQTT_MODE} rabbitmq=${RABBITMQ_MODE}"
+  if [[ "$src_dir" == "$src_tmp" || "$src_dir" == "$src_tmp"/* ]]; then
+    rm -rf "$src_tmp"
+  else
+    rm -rf "$src_tmp"
+  fi
 
   ok "工作目录: $WORKDIR"
-  ok "变体: $COMPOSE_VARIANT  ($src_compose → docker-compose.yml)"
+  ok "变体: $COMPOSE_VARIANT"
 
   choose_start
   if [[ "$START_MODE" == "start" ]]; then
     have_cmd docker || die "未安装 Docker，无法启动"
-    info "拉取镜像并启动（ghcr.io/zuoa/video-ba-pipe:rk）"
+    info "拉取镜像并启动"
     (
       cd "$WORKDIR"
       docker compose pull
@@ -853,12 +976,14 @@ print_summary() {
   local ip
   ip="$(host_ip)"
   printf '\n%s======== 完成 ========%s\n' "$C_BOLD" "$C_RESET"
+  log "平台          : ${PLATFORM}"
   log "RKNN Runtime : ${RKNN_OLD_VERSION} → ${RKNN_NEW_VERSION:-$RKNN_OLD_VERSION}  (${RKNN_ACTION})"
   [[ -n "$RKNN_BACKUP_DIR" ]] && log "RKNN 备份     : ${RKNN_BACKUP_DIR}  (回滚: sudo bash ${RKNN_BACKUP_DIR}/restore.sh)"
   log "Docker        : ${DOCKER_VERSION:-$(docker --version 2>/dev/null || echo skipped)}"
   log "Compose       : ${COMPOSE_VERSION:-$(docker compose version 2>/dev/null || echo skipped)}"
-  log "部署变体      : ${COMPOSE_VARIANT}"
+  log "额外服务      : MQTT=${MQTT_MODE:-n/a}  RabbitMQ=${RABBITMQ_MODE:-n/a}"
   log "工作目录      : ${WORKDIR}"
+  [[ "$RABBITMQ_MODE" == "rabbitmq" ]] && log "RabbitMQ 管理 : http://${ip}:15672  (admin / admin123)"
   log ""
   log "访问:"
   log "  前端  http://${ip}:8080"
